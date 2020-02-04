@@ -5,7 +5,6 @@ __pycache__/
 
 # C extensions
 *.so
-
 # Distribution / packaging
 .Python
 build/
@@ -89,6 +88,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+conda_env/
 
 # Spyder project settings
 .spyderproject
@@ -129,3 +129,9 @@ debug.bin
 debug2.bin
 events.out.*
 poetry/oldpoet
+.idea
+gpt
+
+# datasets
+*.txt
+*.csv

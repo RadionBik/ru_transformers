@@ -24,16 +24,17 @@ from __future__ import absolute_import, division, print_function
 import argparse
 import glob
 import logging
-import os
 import pickle
-import random
-import regex as re
 import shutil
 
-import numpy as np
+import os
+import random
 import torch
-from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler
+from fastai.torch_core import flatten_model, requires_grad
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import SequentialSampler, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
+import regex as re
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -41,24 +42,18 @@ except:
     from tensorboardX import SummaryWriter
 
 from tqdm import tqdm, trange
+from yt_encoder import YTEncoder
 from dataclasses import dataclass
-from fastprogress import progress_bar
-from fastai.basics import *
-
 from run_generation import sample_sequence
 
-from transformers import (WEIGHTS_NAME, AdamW, get_linear_schedule_with_warmup, get_constant_schedule, get_cosine_schedule_with_warmup,
-                                  BertConfig, BertForMaskedLM, BertTokenizer,
-                                  GPT2Config, GPT2LMHeadModel, GPT2Tokenizer,
-                                  OpenAIGPTConfig, OpenAIGPTLMHeadModel, OpenAIGPTTokenizer,
-                                  RobertaConfig, RobertaForMaskedLM, RobertaTokenizer,
-                                  DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer)
-
-from sp_encoder import SPEncoder
-from yt_encoder import YTEncoder
+from transformers import (WEIGHTS_NAME, AdamW, WarmupCosineSchedule, WarmupConstantSchedule,
+                          BertConfig, BertForMaskedLM, BertTokenizer,
+                          GPT2Config, GPT2LMHeadModel, GPT2Tokenizer,
+                          OpenAIGPTConfig, OpenAIGPTLMHeadModel, OpenAIGPTTokenizer,
+                          RobertaConfig, RobertaForMaskedLM, RobertaTokenizer,
+                          DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer)
 
 logger = logging.getLogger(__name__)
-
 
 MODEL_CLASSES = {
     'gpt2': (GPT2Config, GPT2LMHeadModel, GPT2Tokenizer),
@@ -68,19 +63,23 @@ MODEL_CLASSES = {
     'distilbert': (DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer)
 }
 
+
 @dataclass
 class MovingLoss():
-    steps:int=1000
+    steps: int = 1000
     avg_loss = (0.0, 0.0)
-    def add(self, batch_loss:float):
-        k_s = 1 - 1/self.steps
+
+    def add(self, batch_loss: float):
+        k_s = 1 - 1 / self.steps
         avg_loss = self.avg_loss
-        self.avg_loss = (self.avg_loss[0] * k_s + batch_loss * (1-k_s),
-                         self.avg_loss[1] * k_s + 1.0 * (1-k_s))
+        self.avg_loss = (self.avg_loss[0] * k_s + batch_loss * (1 - k_s),
+                         self.avg_loss[1] * k_s + 1.0 * (1 - k_s))
+
     @property
     def loss(self):
         if self.avg_loss[1]:
             return self.avg_loss[0] / self.avg_loss[1]
+
 
 def print_sample(model, tokenizer, device, args):
     model.eval()
@@ -94,16 +93,17 @@ def print_sample(model, tokenizer, device, args):
         top_k=0,
         top_p=0.9,
         device=device,
-        #is_xlnet=bool(args.model_type == "xlnet"),
+        # is_xlnet=bool(args.model_type == "xlnet"),
     )
     out = out[0, len(context_tokens):].tolist()
     text = raw_text + tokenizer.decode(out)
     print(text)
-    
-    with open(os.path.join(args.output_dir, 'sample.txt'), 'w') as f: 
+
+    with open(os.path.join(args.output_dir, 'sample.txt'), 'w') as f:
         f.write(text)
-    
+
     model.train()
+
 
 class TextDataset(Dataset):
     @staticmethod
@@ -121,7 +121,7 @@ class TextDataset(Dataset):
                 text = f.read()
             if hasattr(tokenizer, 'encode'):
                 tokenized_text = tokenizer.encode(text)
-            else: 
+            else:
                 tokenized_text = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(text))
             with open(cached_features_file, 'wb') as handle:
                 pickle.dump(tokenized_text, handle, protocol=pickle.HIGHEST_PROTOCOL)
@@ -131,8 +131,8 @@ class TextDataset(Dataset):
         max_shift = max(min(block_size, len(tokenized_text) - block_size), 0)
         rnd_shift = random.randrange(max_shift) if max_shift and shuffle else 0
 
-        for i in range(rnd_shift, len(tokenized_text)-block_size+1, block_size):
-            examples.append(tokenizer.add_special_tokens_single_sentence(tokenized_text[i:i+block_size]))
+        for i in range(rnd_shift, len(tokenized_text) - block_size + 1, block_size):
+            examples.append(tokenizer.add_special_tokens_single_sentence(tokenized_text[i:i + block_size]))
         # Note that we are loosing the last truncated example here for the sake of simplicity (no padding)
         # If your dataset is small, first you should loook for a bigger one :-) and second you
         # can change this behavior by adding (model specific) padding.
@@ -146,15 +146,15 @@ class TextDataset(Dataset):
             files = [file_path]
         else:
             assert os.path.isdir(file_path)
-            files =  glob.glob(os.path.join(file_path, '*.txt'))
-        
+            files = glob.glob(os.path.join(file_path, '*.txt'))
+
         files = sorted(files)
         if shuffle: random.shuffle(files)
-        
+
         files = files[:10000]
 
         self.examples = []
-        for fn in progress_bar(files):
+        for fn in files:
             self.examples.extend(self.process_file(fn, tokenizer, args.block_size, shuffle))
 
     def __len__(self):
@@ -164,18 +164,47 @@ class TextDataset(Dataset):
         return torch.tensor(self.examples[item])
 
 
+class ConvDataset(Dataset):
+    def __init__(self, tokenizer, file_path='train', args=None, shuffle=True):
+        logger.info(f"Loading features from {file_path}")
+        with open(file_path, 'r') as ft:
+            text_lines = ft.readlines()
+
+        tok_lines = tokenizer.encode(text_lines)
+        # set empirically from the dataset. needed to produce tensors with the same size, to allow batch training
+        # it doesn't help, since model trains to predict <pad> symbols (now it is obvious)
+        TOKEN_LIMIT = 40
+        padded_tokens = []
+        for line in tok_lines:
+            line_len = len(line)
+            if line_len > TOKEN_LIMIT:
+                padded_tokens.append(line[:TOKEN_LIMIT])
+            else:
+                padded_tokens.append(line + (TOKEN_LIMIT - line_len) * [0])
+
+        self.examples = tok_lines
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, index):
+        return torch.tensor(self.examples[index])
+
+
 def load_and_cache_examples(args, tokenizer, evaluate=False):
-    dataset = TextDataset(tokenizer, file_path=args.eval_data_file if evaluate else args.train_data_file, args=args, shuffle=not evaluate)
+    dataset = ConvDataset(tokenizer, file_path=args.eval_data_file if evaluate else args.train_data_file, args=args,
+                          shuffle=not evaluate)
     return dataset
 
 
 def set_seed(args):
-    return # no
+    return  # no
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if args.n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
+
 
 def _rotate_checkpoints(args, checkpoint_prefix, use_mtime=False):
     if not args.save_total_limit:
@@ -211,7 +240,8 @@ def mask_tokens(inputs, tokenizer, args):
     labels = inputs.clone()
     # We sample a few tokens in each sequence for masked-LM training (with probability args.mlm_probability defaults to 0.15 in Bert/RoBERTa)
     probability_matrix = torch.full(labels.shape, args.mlm_probability)
-    special_tokens_mask = [tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in labels.tolist()]
+    special_tokens_mask = [tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in
+                           labels.tolist()]
     probability_matrix.masked_fill_(torch.tensor(special_tokens_mask, dtype=torch.bool), value=0.0)
     masked_indices = torch.bernoulli(probability_matrix).bool()
     labels[~masked_indices] = -1  # We only compute loss on masked tokens
@@ -228,6 +258,7 @@ def mask_tokens(inputs, tokenizer, args):
     # The rest of the time (10% of the time) we keep the masked input tokens unchanged
     return inputs, labels
 
+
 def save_state(args, model, tokenizer, global_step):
     def save_dir(output_dir):
         # Create output directory if needed
@@ -236,7 +267,8 @@ def save_state(args, model, tokenizer, global_step):
         logger.info(f"Saving model checkpoint to {output_dir}")
         # Save a trained model, configuration and tokenizer using `save_pretrained()`.
         # They can then be reloaded using `from_pretrained()`
-        model_to_save = model.module if hasattr(model, 'module') else model  # Take care of distributed/parallel training
+        model_to_save = model.module if hasattr(model,
+                                                'module') else model  # Take care of distributed/parallel training
         model_to_save.save_pretrained(output_dir)
         tokenizer.save_pretrained(output_dir)
 
@@ -250,15 +282,17 @@ def save_state(args, model, tokenizer, global_step):
     save_dir(output_dir)
     _rotate_checkpoints(args, checkpoint_prefix)
 
+
 class SummaryWriterP(SummaryWriter):
     def __init__(self, prefix=None, logdir=None, comment='', *args, **kwargs):
         if prefix:
             import socket
             from datetime import datetime
             current_time = datetime.now().strftime('%b%d_%H-%M-%S')
-            logdir = os.path.join(prefix, 
-                'runs', current_time + '_' + socket.gethostname() + comment)
-        super().__init__(logdir, comment, *args, **kwargs) 
+            logdir = os.path.join(prefix,
+                                  'runs', current_time + '_' + socket.gethostname() + comment)
+        super().__init__(logdir, comment, *args, **kwargs)
+
 
 def train(args, train_dataset, model, tokenizer):
     """ Train the model """
@@ -278,15 +312,17 @@ def train(args, train_dataset, model, tokenizer):
     # Prepare optimizer and schedule (linear warmup and decay)
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
-        {'params': [p for n, p in model.named_parameters() if p.requires_grad and not any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
-        {'params': [p for n, p in model.named_parameters() if p.requires_grad and any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-        ]
+        {'params': [p for n, p in model.named_parameters() if p.requires_grad and not any(nd in n for nd in no_decay)],
+         'weight_decay': args.weight_decay},
+        {'params': [p for n, p in model.named_parameters() if p.requires_grad and any(nd in n for nd in no_decay)],
+         'weight_decay': 0.0}
+    ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
     warmup_steps = args.warmup_samples // args.train_batch_size
     if args.lr_decay:
-        scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps=warmup_steps, t_total=t_total)
+        scheduler = WarmupCosineSchedule(optimizer, warmup_steps=warmup_steps, t_total=t_total)
     else:
-        scheduler = get_constant_schedule(optimizer, warmup_steps=warmup_steps)
+        scheduler = WarmupConstantSchedule(optimizer, warmup_steps=warmup_steps)
 
     if args.fp16:
         try:
@@ -311,23 +347,24 @@ def train(args, train_dataset, model, tokenizer):
     logger.info("  Num Epochs = %d", args.num_train_epochs)
     logger.info("  Instantaneous batch size per GPU = %d", args.per_gpu_train_batch_size)
     logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
-                   args.train_batch_size * args.gradient_accumulation_steps * (torch.distributed.get_world_size() if args.local_rank != -1 else 1))
+                args.train_batch_size * args.gradient_accumulation_steps * (
+                    torch.distributed.get_world_size() if args.local_rank != -1 else 1))
     logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
     logger.info("  Total optimization steps = %d", t_total)
 
     try:
-        with open(os.path.join(args.model_name_or_path, 'step.txt'), 'r') as c: 
+        with open(os.path.join(args.model_name_or_path, 'step.txt'), 'r') as c:
             global_step = int(c.readline())
     except OSError as e:
         global_step = 0
 
     tr_loss, logging_loss = 0.0, 0.0
-    moving_loss = MovingLoss(10000//args.logging_steps)
+    moving_loss = MovingLoss(10000 // args.logging_steps)
     model.zero_grad()
 
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     set_seed(args)  # Added here for reproducibility (even between python 2 and 3)
-    try:    
+    try:
         for _ in train_iterator:
             epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
             for step, batch in enumerate(epoch_iterator):
@@ -369,9 +406,10 @@ def train(args, train_dataset, model, tokenizer):
 
                     if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
                         tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
-                        tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
+                        tb_writer.add_scalar('loss', (tr_loss - logging_loss) / args.logging_steps, global_step)
                         logging_loss = tr_loss
-                        epoch_iterator.set_postfix(MovingLoss=f'{moving_loss.loss:.2f}', Perplexity=f'{torch.exp(torch.tensor(moving_loss.loss)):.2f}')
+                        epoch_iterator.set_postfix(MovingLoss=f'{moving_loss.loss:.2f}',
+                                                   Perplexity=f'{torch.exp(torch.tensor(moving_loss.loss)):.2f}')
 
                     if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
                         # Save model checkpoint
@@ -422,7 +460,7 @@ def evaluate(args, model, tokenizer, prefix=""):
         with torch.no_grad():
             outputs = model(batch, masked_lm_labels=batch) if args.mlm else model(batch, labels=batch)
             lm_loss = outputs[0]
-            eval_loss += lm_loss.item() #lm_loss.mean().item()
+            eval_loss += lm_loss.item()  # lm_loss.mean().item()
         nb_eval_steps += 1
 
     eval_loss = eval_loss / nb_eval_steps
@@ -546,11 +584,14 @@ def main():
         raise ValueError("BERT and RoBERTa do not have LM heads but masked LM heads. They must be run using the --mlm "
                          "flag (masked language modeling).")
     if args.eval_data_file is None and args.do_eval:
-        raise ValueError("Cannot do evaluation without an evaluation data file. Either supply a file to --eval_data_file "
-                         "or remove the --do_eval argument.")
+        raise ValueError(
+            "Cannot do evaluation without an evaluation data file. Either supply a file to --eval_data_file "
+            "or remove the --do_eval argument.")
 
-    if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
-        raise ValueError(f"Output directory ({args.output_dir}) already exists and is not empty. Use --overwrite_output_dir to overcome.")
+    if os.path.exists(args.output_dir) and os.listdir(
+            args.output_dir) and args.do_train and not args.overwrite_output_dir:
+        raise ValueError(
+            f"Output directory ({args.output_dir}) already exists and is not empty. Use --overwrite_output_dir to overcome.")
 
     # Setup distant debugging if needed
     if args.server_ip and args.server_port:
@@ -572,11 +613,11 @@ def main():
     args.device = device
 
     # Setup logging
-    logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
-                        datefmt = '%m/%d/%Y %H:%M:%S',
-                        level = logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
+    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
+                        datefmt='%m/%d/%Y %H:%M:%S',
+                        level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
     logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
-                    args.local_rank, args.device, args.n_gpu, bool(args.local_rank != -1), args.fp16)
+                   args.local_rank, args.device, args.n_gpu, bool(args.local_rank != -1), args.fp16)
 
     # Set seed
     set_seed(args)
@@ -584,33 +625,36 @@ def main():
     # Load pretrained model and tokenizer
     if args.local_rank not in [-1, 0]:
         torch.distributed.barrier()  # Barrier to make sure only the first process in distributed training download model & vocab
-    
+
     config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
     config = config_class.from_pretrained(args.config_name if args.config_name else args.model_name_or_path)
     if args.tokenizer_class: tokenizer_class = globals()[args.tokenizer_class]
-    tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, do_lower_case=args.do_lower_case)
+    # TODO check tokenizer here
+    tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
+                                                do_lower_case=args.do_lower_case)
     if args.block_size <= 0:
         args.block_size = tokenizer.max_len_single_sentence  # Our input block size will be the max possible for the model
     args.block_size = min(args.block_size, tokenizer.max_len_single_sentence)
-    model = model_class.from_pretrained(args.model_name_or_path, from_tf=bool('.ckpt' in args.model_name_or_path), config=config)
+    model = model_class.from_pretrained(args.model_name_or_path, from_tf=bool('.ckpt' in args.model_name_or_path),
+                                        config=config)
     model.to(args.device)
 
-    print(200*'/')
-    print(len([param for item in flatten_model(model) 
-            for param in item.parameters()
-                if param.requires_grad]))    # freeze all layers but few first and last
+    print(200 * '/')
+    print(len([param for item in flatten_model(model)
+               for param in item.parameters()
+               if param.requires_grad]))  # freeze all layers but few first and last
     if args.unfreeze_level >= 0:
         flat = flatten_model(model)
         flat = [item for item in flat if list(item.parameters())]
         i_start = 3
         i_end = 1
-        need_grads = set(flat[:i_start+args.unfreeze_level*3]) | set(flat[-(i_end+args.unfreeze_level*3):])
+        need_grads = set(flat[:i_start + args.unfreeze_level * 3]) | set(flat[-(i_end + args.unfreeze_level * 3):])
         for item in flat:
             requires_grad(item, item in need_grads)
-        print(200*'/')
-        print(len([param for item in flatten_model(model) 
-                for param in item.parameters()
-                    if param.requires_grad]))
+        print(200 * '/')
+        print(len([param for item in flatten_model(model)
+                   for param in item.parameters()
+                   if param.requires_grad]))
 
     if args.local_rank == 0:
         torch.distributed.barrier()  # End of barrier to make sure only the first process in distributed training download model & vocab
@@ -629,7 +673,7 @@ def main():
 
         global_step, tr_loss = train(args, train_dataset, model, tokenizer)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
-        
+
     # Saving best-practices: if you use save_pretrained for the model and tokenizer, you can reload them using from_pretrained()
     if args.do_train and (args.local_rank == -1 or torch.distributed.get_rank() == 0):
         save_state(args, model, tokenizer, global_step)
@@ -644,7 +688,8 @@ def main():
     if args.do_eval and args.local_rank in [-1, 0]:
         checkpoints = [args.output_dir]
         if args.eval_all_checkpoints:
-            checkpoints = list(os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
+            checkpoints = list(
+                os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
             logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce logging
         logger.info("Evaluate the following checkpoints: %s", checkpoints)
         for checkpoint in checkpoints:
