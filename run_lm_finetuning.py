@@ -214,7 +214,6 @@ def train(args, train_dataset, model, tokenizer):
     if args.local_rank in [-1, 0]:
         tb_writer = SummaryWriterP(args.output_dir)
 
-    args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     train_sampler = SequentialSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
@@ -581,6 +580,7 @@ def main():
         if args.local_rank not in [-1, 0]:
             torch.distributed.barrier()  # Barrier to make sure only the first process in distributed training process the dataset, and the others will use the cache
 
+        args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
         train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False)
 
         if args.local_rank == 0:
