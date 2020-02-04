@@ -43,6 +43,7 @@ except:
 
 from tqdm import tqdm, trange
 from yt_encoder import YTEncoder
+from chat_util import ConvDataset
 from dataclasses import dataclass
 from run_generation import sample_sequence
 
@@ -103,94 +104,6 @@ def print_sample(model, tokenizer, device, args):
         f.write(text)
 
     model.train()
-
-
-class TextDataset(Dataset):
-    @staticmethod
-    def process_file(file_path, tokenizer, block_size, shuffle):
-        directory, filename = os.path.split(file_path)
-        directory = os.path.join(directory, 'cached')
-        os.makedirs(directory, exist_ok=True)
-        cached_features_file = os.path.join(directory, f'cached_lm_{block_size}_{tokenizer.hash}_{filename}')
-
-        if os.path.exists(cached_features_file):
-            with open(cached_features_file, 'rb') as handle:
-                tokenized_text = pickle.load(handle)
-        else:
-            with open(file_path, encoding="utf-8") as f:
-                text = f.read()
-            if hasattr(tokenizer, 'encode'):
-                tokenized_text = tokenizer.encode(text)
-            else:
-                tokenized_text = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(text))
-            with open(cached_features_file, 'wb') as handle:
-                pickle.dump(tokenized_text, handle, protocol=pickle.HIGHEST_PROTOCOL)
-
-        examples = []
-        # add random shift 
-        max_shift = max(min(block_size, len(tokenized_text) - block_size), 0)
-        rnd_shift = random.randrange(max_shift) if max_shift and shuffle else 0
-
-        for i in range(rnd_shift, len(tokenized_text) - block_size + 1, block_size):
-            examples.append(tokenizer.add_special_tokens_single_sentence(tokenized_text[i:i + block_size]))
-        # Note that we are loosing the last truncated example here for the sake of simplicity (no padding)
-        # If your dataset is small, first you should loook for a bigger one :-) and second you
-        # can change this behavior by adding (model specific) padding.
-        return examples
-
-    def __init__(self, tokenizer, file_path='train', args=None, shuffle=True):
-        if not hasattr(tokenizer, 'hash'): tokenizer.hash = ''
-
-        logger.info(f"Loading features from {file_path}")
-        if os.path.isfile(file_path):
-            files = [file_path]
-        else:
-            assert os.path.isdir(file_path)
-            files = glob.glob(os.path.join(file_path, '*.txt'))
-
-        files = sorted(files)
-        if shuffle: random.shuffle(files)
-
-        files = files[:10000]
-
-        self.examples = []
-        for fn in files:
-            self.examples.extend(self.process_file(fn, tokenizer, args.block_size, shuffle))
-
-    def __len__(self):
-        return len(self.examples)
-
-    def __getitem__(self, item):
-        return torch.tensor(self.examples[item])
-
-
-class ConvDataset(Dataset):
-    def __init__(self, tokenizer, file_path='train', args=None, shuffle=True, pad=False):
-        logger.info(f"Loading features from {file_path}")
-        with open(file_path, 'r') as ft:
-            text_lines = ft.readlines()
-
-        tok_lines = tokenizer.encode(text_lines)
-        if pad:
-            # set empirically from the dataset. needed to produce tensors with the same size, to allow batch training
-            # it doesn't help, since model trains to predict <pad> symbols (now it is obvious)
-            TOKEN_LIMIT = 40
-            padded_tokens = []
-            for line in tok_lines:
-                line_len = len(line)
-                if line_len > TOKEN_LIMIT:
-                    padded_tokens.append(line[:TOKEN_LIMIT])
-                else:
-                    padded_tokens.append(line + (TOKEN_LIMIT - line_len) * [0])
-            self.examples = padded_tokens
-        else:
-            self.examples = tok_lines
-
-    def __len__(self):
-        return len(self.examples)
-
-    def __getitem__(self, index):
-        return torch.tensor(self.examples[index])
 
 
 def load_and_cache_examples(args, tokenizer, evaluate=False):
@@ -302,7 +215,7 @@ def train(args, train_dataset, model, tokenizer):
         tb_writer = SummaryWriterP(args.output_dir)
 
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
-    train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
+    train_sampler = SequentialSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
     if args.max_steps > 0:
