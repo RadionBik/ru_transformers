@@ -165,24 +165,26 @@ class TextDataset(Dataset):
 
 
 class ConvDataset(Dataset):
-    def __init__(self, tokenizer, file_path='train', args=None, shuffle=True):
+    def __init__(self, tokenizer, file_path='train', args=None, shuffle=True, pad=False):
         logger.info(f"Loading features from {file_path}")
         with open(file_path, 'r') as ft:
             text_lines = ft.readlines()
 
         tok_lines = tokenizer.encode(text_lines)
-        # set empirically from the dataset. needed to produce tensors with the same size, to allow batch training
-        # it doesn't help, since model trains to predict <pad> symbols (now it is obvious)
-        TOKEN_LIMIT = 40
-        padded_tokens = []
-        for line in tok_lines:
-            line_len = len(line)
-            if line_len > TOKEN_LIMIT:
-                padded_tokens.append(line[:TOKEN_LIMIT])
-            else:
-                padded_tokens.append(line + (TOKEN_LIMIT - line_len) * [0])
-
-        self.examples = tok_lines
+        if pad:
+            # set empirically from the dataset. needed to produce tensors with the same size, to allow batch training
+            # it doesn't help, since model trains to predict <pad> symbols (now it is obvious)
+            TOKEN_LIMIT = 40
+            padded_tokens = []
+            for line in tok_lines:
+                line_len = len(line)
+                if line_len > TOKEN_LIMIT:
+                    padded_tokens.append(line[:TOKEN_LIMIT])
+                else:
+                    padded_tokens.append(line + (TOKEN_LIMIT - line_len) * [0])
+            self.examples = padded_tokens
+        else:
+            self.examples = tok_lines
 
     def __len__(self):
         return len(self.examples)
