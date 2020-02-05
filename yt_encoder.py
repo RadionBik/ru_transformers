@@ -29,11 +29,12 @@ class YTEncoder(PreTrainedTokenizer):
         # text = re.sub(r'(?=[^ ])([\W])([\w])',r'\g<1> \g<2>',text)
         # text = text.replace('\n', f' {NEW_LINE} ')
 
-        return self.bpe.encode(text, output_type=yttm.OutputType.ID, eos=True)
+        return self.bpe.encode(text, output_type=yttm.OutputType.ID, eos=True, bos=True)
 
     def decode(self, tokens):  # I hate regexps
         if not isinstance(tokens, list):
             tokens = tokens.tolist()
+        # result = self.bpe.decode(tokens, ignore_ids=[738, 6206, 463, 37])[0]
         result = self.bpe.decode(tokens)[0]
         result = re.sub(r'( )?(<\|n\|>)( )?', r'\n', result)
         result = re.sub(r'([\n(]) (\w)', r'\g<1>\g<2>', result)
